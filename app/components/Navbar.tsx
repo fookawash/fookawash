@@ -51,7 +51,7 @@ export default function Navbar() {
         href="/"
         className="text-2xl sm:text-3xl font-extrabold tracking-wide hover:text-blue-100 transition"
       >
-        🚗 CarWash
+        🚗 FOOKA WASH
       </a>
 
       {/* Navigation Links */}
