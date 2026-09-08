@@ -954,6 +954,21 @@ await channel.subscribe();
                   <strong>Car Number:</strong>{" "}
                   {item.car_number}
                 </p>
+                <p>
+  <strong>📍 Service Location:</strong>{" "}
+  {item.location_address || "Location not provided"}
+</p>
+
+{item.latitude && item.longitude && (
+  <a
+    href={`https://www.google.com/maps?q=${item.latitude},${item.longitude}`}
+    target="_blank"
+    rel="noopener noreferrer"
+    className="inline-block mt-2 text-blue-600 font-semibold hover:underline"
+  >
+    🗺️ Open Location in Google Maps
+  </a>
+)}
 
                 <p>
                   <strong>Service:</strong>{" "}

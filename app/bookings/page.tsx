@@ -379,6 +379,10 @@ useEffect(() => {
               <p className="break-words">
                 <strong>Car Number:</strong> {item.car_number}
               </p>
+              <p className="break-words">
+  <strong>📍 Service Location:</strong>{" "}
+  {item.location_address || "Location not provided"}
+</p>
 
               {/* Service */}
               <p className="break-words">

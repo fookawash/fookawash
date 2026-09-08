@@ -8,11 +8,11 @@ export default function Home() {
       <div className="flex min-h-[70vh] sm:min-h-[80vh] items-center justify-center text-center px-4 bg-gradient-to-b from-blue-50 to-white">
         <div className="max-w-3xl mx-auto">
           <h2 className="text-4xl sm:text-6xl font-extrabold text-blue-600 tracking-tight leading-tight">
-            Professional Car Wash
+            FOOKA WASH
           </h2>
 
           <p className="mt-5 text-lg sm:text-xl text-gray-600 max-w-xl mx-auto leading-relaxed">
-            Premium car care at your doorstep
+            Premium car care, At your doorstep
           </p>
 
           <a

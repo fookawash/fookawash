@@ -7,7 +7,7 @@ export default function About() {
           <div className="text-5xl mb-4">🚗✨</div>
 
           <h2 className="text-4xl sm:text-5xl font-extrabold text-blue-600 tracking-tight">
-            About CarWash
+            About FOOKA WASH
           </h2>
 
           <p className="mt-4 text-lg sm:text-xl text-gray-600 max-w-2xl mx-auto leading-relaxed">

@@ -150,9 +150,13 @@ export default function BookingPage() {
   const [phone, setPhone] = useState("");
   const [carCompany, setCarCompany] = useState("");
 const [carModel, setCarModel] = useState("");
-  const [service, setService] = useState("");
-  const [date, setDate] = useState("");
-  const [time, setTime] = useState("");
+const [locationAddress, setLocationAddress] = useState("");
+const [latitude, setLatitude] = useState<number | null>(null);
+const [longitude, setLongitude] = useState<number | null>(null);
+const [locationLoading, setLocationLoading] = useState(false);
+const [service, setService] = useState("");
+const [date, setDate] = useState("");
+const [time, setTime] = useState("");
 
   const [message, setMessage] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -192,16 +196,111 @@ const [carModel, setCarModel] = useState("");
     }
   }, []);
 
+  const getCurrentLocation = () => {
+  setLocationLoading(true);
+
+  const getLocation = (highAccuracy: boolean) => {
+    navigator.geolocation.getCurrentPosition(
+      async (position) => {
+        const { latitude, longitude } = position.coords;
+
+        console.log("GPS location:", latitude, longitude);
+
+        setLatitude(latitude);
+        setLongitude(longitude);
+
+        try {
+          const response = await fetch(
+            `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${latitude}&longitude=${longitude}&localityLanguage=en`
+          );
+
+          console.log("Reverse geocoding response:", response);
+
+          if (!response.ok) {
+            throw new Error("Unable to find address");
+          }
+
+          const data = await response.json();
+
+          console.log("Reverse geocoding data:", data);
+
+          const readableLocation = [
+            data.locality,
+            data.city,
+            data.principalSubdivision,
+            data.postcode,
+          ]
+            .filter(Boolean)
+            .filter(
+              (value, index, array) =>
+                array.indexOf(value) === index
+            )
+            .join(", ");
+
+          setLocationAddress(
+            readableLocation ||
+              `Current Location (${latitude.toFixed(6)}, ${longitude.toFixed(6)})`
+          );
+        } catch (error) {
+          console.error("Reverse geocoding error:", error);
+
+          setLocationAddress(
+            `Current Location (${latitude.toFixed(6)}, ${longitude.toFixed(6)})`
+          );
+        } finally {
+          setLocationLoading(false);
+        }
+      },
+      (error) => {
+        console.error(
+          `Location attempt failed (${highAccuracy ? "high" : "low"} accuracy):`,
+          error
+        );
+
+        if (!highAccuracy) {
+          console.log("Retrying location with high accuracy...");
+
+          getLocation(true);
+          return;
+        }
+
+        setLocationLoading(false);
+
+        alert(
+          `Unable to get your location (${error.code}): ${error.message}`
+        );
+      },
+      {
+        enableHighAccuracy: highAccuracy,
+        timeout: highAccuracy ? 60000 : 30000,
+        maximumAge: 300000,
+      }
+    );
+  };
+
+  getLocation(false);
+};
+
   const handleBooking = async () => {
     if (!user) {
       alert("Please login first!");
       return;
     }
 
-    if (!name || !carNumber || !phone || !service || !date || !time) {
-    alert("Please fill all the fields before confirming your booking.");
-    return;
-  }
+    if (!name || !carNumber || !phone || !locationAddress || !service || !date || !time) {
+  const missingFields = [];
+
+  if (!name) missingFields.push("Name");
+  if (!carNumber) missingFields.push("Car Number");
+  if (!phone) missingFields.push("Phone Number");
+  if (!locationAddress) missingFields.push("Service Location");
+  if (!service) missingFields.push("Service");
+  if (!date) missingFields.push("Date");
+  if (!time) missingFields.push("Time");
+
+  alert(`Missing field(s): ${missingFields.join(", ")}`);
+  return;
+}
   if (!/^[6-9]\d{9}$/.test(phone)) {
   alert("Please enter a valid Indian mobile number.");
   return;
@@ -240,6 +339,9 @@ setSubmitting(true);
       car_company: carCompany,
       car_model: carModel,
       phone: phone,
+      location_address: locationAddress,
+      latitude: latitude,
+      longitude: longitude,
       service,
       date,
       time,
@@ -398,7 +500,45 @@ setTimeout(() => {
     onChange={(e) => setPhone(e.target.value.replace(/\D/g, ""))}
     className="w-full border border-gray-300 rounded-xl p-3 focus:outline-none focus:ring-2 focus:ring-blue-500"
   />
+
+         </div>
+
+{/* Service Location */}
+<div className="mb-5">
+  <label className="block text-sm font-semibold text-gray-700 mb-2">
+    📍 Service Location
+  </label>
+
+  <input
+    type="text"
+    placeholder="Enter your service address"
+    value={locationAddress}
+    onChange={(e) => {
+      setLocationAddress(e.target.value);
+      setLatitude(null);
+      setLongitude(null);
+    }}
+    className="w-full border border-gray-300 rounded-xl p-3 focus:outline-none focus:ring-2 focus:ring-blue-500"
+  />
+
+  <button
+    type="button"
+    onClick={getCurrentLocation}
+    disabled={locationLoading}
+    className="w-full mt-3 border border-blue-500 text-blue-600 rounded-xl p-3 font-semibold hover:bg-blue-50 transition"
+  >
+    {locationLoading
+      ? "📍 Getting your location..."
+      : "📍 Use My Current Location"}
+  </button>
+
+  {latitude !== null && longitude !== null && (
+    <p className="text-sm text-green-600 font-semibold mt-2">
+      ✓ Current location selected
+    </p>
+  )}
 </div>
+
 
           {/* Service */}
           <div className="mb-5">
@@ -522,6 +662,7 @@ setTimeout(() => {
     !(/^[6-9]\d{9}$/.test(phone)) ||
     !carCompany ||
     !carModel ||
+    !locationAddress ||
     !service ||
     !date ||
     !time ||
@@ -534,6 +675,7 @@ setTimeout(() => {
     !(/^[6-9]\d{9}$/.test(phone)) ||
      !carCompany ||
     !carModel ||
+    !locationAddress ||
     !service ||
     !date ||
     !time ||
@@ -543,7 +685,7 @@ setTimeout(() => {
   }`}
 >
   {submitting ? "Booking..." : "Confirm Booking"}
-</button>s
+</button>
 
 {/* Success Message */}
 {message && (
