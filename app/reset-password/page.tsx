@@ -1,9 +1,14 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Image from "next/image";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { supabase } from "../../lib/supabase";
 
 export default function ResetPasswordPage() {
+  const router = useRouter();
+
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
 
@@ -12,16 +17,17 @@ export default function ResetPasswordPage() {
 
   const [checking, setChecking] = useState(true);
   const [validSession, setValidSession] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+
+  const [errorMessage, setErrorMessage] = useState("");
+  const [successMessage, setSuccessMessage] = useState("");
 
   useEffect(() => {
     let mounted = true;
 
     const checkRecoverySession = async () => {
       try {
-        /*
-         * STEP 1:
-         * Listen for Supabase authentication events FIRST.
-         */
+        // 1. Listen for Supabase password recovery events
         const {
           data: { subscription },
         } = supabase.auth.onAuthStateChange((event, session) => {
@@ -33,29 +39,25 @@ export default function ResetPasswordPage() {
           }
         });
 
-        /*
-         * STEP 2:
-         * Supabase password-reset emails may contain
-         * a "code" in the URL.
-         *
-         * We must exchange that code for a session.
-         */
-        const url = new URL(window.location.href);
-        const code = url.searchParams.get("code");
+        // 2. Exchange code if URL contains a code query param (PKCE flow)
+        if (typeof window !== "undefined") {
+          const url = new URL(window.location.href);
+          const code = url.searchParams.get("code");
 
-        if (code) {
-          const { error } =
-            await supabase.auth.exchangeCodeForSession(code);
+          if (code) {
+            const { error: exchangeError } =
+              await supabase.auth.exchangeCodeForSession(code);
 
-          if (error) {
-            console.error("Recovery code error:", error);
+            if (exchangeError) {
+              console.error("Recovery code exchange error:", exchangeError);
+            }
+
+            // Clean the code param from address bar
+            window.history.replaceState({}, document.title, "/reset-password");
           }
         }
 
-        /*
-         * STEP 3:
-         * Now check whether a valid session exists.
-         */
+        // 3. Verify if active session exists
         const {
           data: { session },
         } = await supabase.auth.getSession();
@@ -70,23 +72,11 @@ export default function ResetPasswordPage() {
 
         setChecking(false);
 
-        /*
-         * Remove the code from the address bar.
-         */
-        if (code) {
-          window.history.replaceState(
-            {},
-            document.title,
-            "/reset-password"
-          );
-        }
-
         return () => {
           subscription.unsubscribe();
         };
       } catch (error) {
-        console.error("Recovery session error:", error);
-
+        console.error("Recovery verification error:", error);
         if (mounted) {
           setValidSession(false);
           setChecking(false);
@@ -101,166 +91,222 @@ export default function ResetPasswordPage() {
     };
   }, []);
 
-  const handleResetPassword = async () => {
+  const handleResetPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMessage("");
+    setSuccessMessage("");
+
     if (!password || !confirmPassword) {
-      alert("Please fill both password fields.");
+      setErrorMessage("Please complete both password fields.");
       return;
     }
 
     if (password.length < 6) {
-      alert("Password must be at least 6 characters.");
+      setErrorMessage("Password must be at least 6 characters long.");
       return;
     }
 
     if (password !== confirmPassword) {
-      alert("Passwords do not match.");
+      setErrorMessage("Passwords do not match. Please re-enter.");
       return;
     }
+
+    setSubmitting(true);
 
     const { error } = await supabase.auth.updateUser({
       password: password,
     });
 
     if (error) {
-      alert(error.message);
+      setErrorMessage(error.message);
+      setSubmitting(false);
       return;
     }
 
-    alert("Password updated successfully!");
+    setSuccessMessage("Password updated successfully! Redirecting to login...");
 
+    // Sign out the recovery session so customer logs in fresh with the new password
     await supabase.auth.signOut();
 
-    window.location.href = "/login";
+    setTimeout(() => {
+      router.push("/login");
+    }, 1500);
   };
 
-  /*
-   * Loading screen while Supabase processes
-   * the password recovery link.
-   */
+  // State 1: Verifying Recovery Token
   if (checking) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 via-white to-blue-100 px-4">
-        <div className="w-full max-w-md bg-white p-8 rounded-3xl shadow-xl border border-gray-100 text-center">
-          <div className="text-4xl mb-4">🔐</div>
-
-          <h1 className="text-2xl font-bold text-gray-800 mb-2">
+      <main className="min-h-screen bg-slate-50 flex flex-col justify-center items-center px-4 select-none">
+        <div className="w-full max-w-md bg-white p-8 rounded-3xl shadow-xl shadow-slate-200/50 border border-slate-200/80 text-center space-y-3">
+          <div className="w-10 h-10 border-4 border-orange-500 border-t-transparent rounded-full animate-spin mx-auto" />
+          <h1 className="text-lg font-black text-slate-900 tracking-tight">
             Verifying Reset Link
           </h1>
-
-          <p className="text-gray-500">
-            Please wait while we verify your password reset link...
+          <p className="text-xs text-slate-500">
+            Please wait while we establish your secure recovery session...
           </p>
         </div>
-      </div>
+      </main>
     );
   }
 
-  /*
-   * Invalid / expired link
-   */
+  // State 2: Expired or Invalid Link
   if (!validSession) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 via-white to-blue-100 px-4">
-        <div className="w-full max-w-md bg-white p-8 rounded-3xl shadow-xl border border-gray-100 text-center">
-          <div className="text-5xl mb-4">🔗</div>
-
-          <h1 className="text-2xl font-bold text-gray-800 mb-3">
-            Reset Link Expired
+      <main className="min-h-screen bg-slate-50 flex flex-col justify-center items-center px-4 select-none">
+        <div className="w-full max-w-md bg-white p-8 rounded-3xl shadow-xl shadow-slate-200/50 border border-slate-200/80 text-center space-y-4">
+          <div className="w-12 h-12 rounded-2xl bg-rose-50 text-rose-600 flex items-center justify-center text-2xl mx-auto">
+            ⚠️
+          </div>
+          <h1 className="text-xl font-black text-slate-900 tracking-tight">
+            Reset Link Expired or Invalid
           </h1>
-
-          <p className="text-gray-500 mb-6">
-            This password reset link is invalid or has expired.
-            Please request a new reset link.
+          <p className="text-xs text-slate-500 leading-relaxed">
+            This password recovery link has either already been used or has expired. Please request a fresh reset link.
           </p>
-
-          <a
-            href="/login"
-            className="block w-full bg-blue-600 text-white py-3 rounded-xl font-bold hover:bg-blue-700 transition"
-          >
-            Go to Login
-          </a>
+          <div className="pt-2 space-y-2">
+            <Link
+              href="/forgot-password"
+              className="block w-full py-3.5 rounded-2xl bg-gradient-to-r from-orange-500 via-rose-500 to-rose-600 text-white font-black text-xs uppercase tracking-wider shadow-md shadow-rose-500/25 hover:opacity-95 transition"
+            >
+              Request New Link
+            </Link>
+            <Link
+              href="/login"
+              className="block w-full py-3 text-xs font-bold text-slate-600 hover:text-slate-900 transition"
+            >
+              Return to Login
+            </Link>
+          </div>
         </div>
-      </div>
+      </main>
     );
   }
 
-  /*
-   * Valid recovery session
-   */
+  // State 3: Active Valid Recovery Session Form
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 via-white to-blue-100 px-4">
-      <div className="w-full max-w-md bg-white p-8 rounded-3xl shadow-xl border border-gray-100">
-
-        <div className="text-center text-4xl mb-3">
-          🔐
-        </div>
-
-        <h1 className="text-3xl font-bold text-center text-gray-800 mb-2">
-          Reset Password
-        </h1>
-
-        <p className="text-center text-gray-500 mb-8">
-          Create a new password for your account
-        </p>
-
-        {/* New Password */}
-        <div className="relative">
-          <input
-            type={showPassword ? "text" : "password"}
-            placeholder="Enter new password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            className="w-full border border-gray-300 p-3 pr-12 rounded-xl shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+    <main className="min-h-screen bg-slate-50 flex flex-col justify-center items-center px-4 py-10 select-none">
+      {/* Top Brand Link */}
+      <Link href="/" className="mb-6 flex items-center gap-2 group">
+        <div className="relative w-8 h-8 rounded-xl overflow-hidden border border-orange-100 shadow-sm group-hover:scale-105 transition">
+          <Image
+            src="/icon-192.png"
+            alt="FOOKA Logo"
+            fill
+            sizes="32px"
+            className="object-cover"
           />
+        </div>
+        <span className="font-black text-base tracking-wider uppercase bg-gradient-to-r from-orange-500 via-rose-500 to-sky-500 bg-clip-text text-transparent">
+          FOOKA WASH
+        </span>
+      </Link>
 
-          <button
-            type="button"
-            onClick={() => setShowPassword(!showPassword)}
-            className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500"
-          >
-            {showPassword ? "🙈" : "👁️"}
-          </button>
+      {/* Reset Card */}
+      <div className="w-full max-w-md bg-white p-6 sm:p-8 rounded-3xl shadow-xl shadow-slate-200/50 border border-slate-200/80">
+        <div className="text-center mb-6">
+          <h1 className="text-2xl sm:text-3xl font-black text-slate-900 tracking-tight">
+            Reset Password
+          </h1>
+          <p className="text-xs sm:text-sm text-slate-500 mt-1 font-medium">
+            Create a new password for your customer account
+          </p>
         </div>
 
-        {/* Confirm Password */}
-        <div className="relative mt-4">
-          <input
-            type={showConfirmPassword ? "text" : "password"}
-            placeholder="Confirm new password"
-            value={confirmPassword}
-            onChange={(e) => setConfirmPassword(e.target.value)}
-            className="w-full border border-gray-300 p-3 pr-12 rounded-xl shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
+        {/* Error Alert */}
+        {errorMessage && (
+          <div className="mb-5 p-3.5 rounded-2xl bg-rose-50 border border-rose-200 text-rose-700 text-xs font-bold text-center">
+            {errorMessage}
+          </div>
+        )}
 
+        {/* Success Alert */}
+        {successMessage && (
+          <div className="mb-5 p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-bold text-center leading-relaxed">
+            {successMessage}
+          </div>
+        )}
+
+        <form onSubmit={handleResetPassword} className="space-y-4">
+          {/* New Password */}
+          <div>
+            <label className="block text-xs font-bold text-slate-700 mb-1.5">
+              New Password
+            </label>
+            <div className="relative">
+              <input
+                type={showPassword ? "text" : "password"}
+                required
+                autoComplete="new-password"
+                placeholder="Enter new password (min 6 characters)"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="w-full min-h-[48px] border border-slate-200 rounded-xl px-3.5 pr-14 text-sm bg-slate-50/50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-orange-500 font-medium text-slate-900 transition"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                className="absolute right-3.5 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400 hover:text-slate-700 transition"
+              >
+                {showPassword ? "Hide" : "Show"}
+              </button>
+            </div>
+          </div>
+
+          {/* Confirm Password */}
+          <div>
+            <label className="block text-xs font-bold text-slate-700 mb-1.5">
+              Confirm New Password
+            </label>
+            <div className="relative">
+              <input
+                type={showConfirmPassword ? "text" : "password"}
+                required
+                autoComplete="new-password"
+                placeholder="Re-type new password"
+                value={confirmPassword}
+                onChange={(e) => setConfirmPassword(e.target.value)}
+                className="w-full min-h-[48px] border border-slate-200 rounded-xl px-3.5 pr-14 text-sm bg-slate-50/50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-orange-500 font-medium text-slate-900 transition"
+              />
+              <button
+                type="button"
+                onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                className="absolute right-3.5 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400 hover:text-slate-700 transition"
+              >
+                {showConfirmPassword ? "Hide" : "Show"}
+              </button>
+            </div>
+          </div>
+
+          {/* Submit Button */}
           <button
-            type="button"
-            onClick={() =>
-              setShowConfirmPassword(!showConfirmPassword)
-            }
-            className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500"
+            type="submit"
+            disabled={submitting}
+            className="w-full mt-2 py-4 rounded-2xl bg-gradient-to-r from-orange-500 via-rose-500 to-rose-600 text-white font-black text-sm uppercase tracking-wider shadow-lg shadow-rose-500/25 hover:opacity-95 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed transition flex items-center justify-center gap-2"
           >
-            {showConfirmPassword ? "🙈" : "👁️"}
+            {submitting ? (
+              <>
+                <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                <span>Updating Password...</span>
+              </>
+            ) : (
+              <>
+                <span>Update Password</span>
+                <span>&rsaquo;</span>
+              </>
+            )}
           </button>
-        </div>
+        </form>
 
-        <button
-          onClick={handleResetPassword}
-          className="w-full bg-blue-600 text-white py-3.5 rounded-xl font-bold text-lg shadow-lg hover:bg-blue-700 transition-all mt-6"
-        >
-          Update Password
-        </button>
-
-        <p className="text-center text-gray-500 mt-6">
-          Remember your password?{" "}
-          <a
+        <div className="mt-6 pt-5 border-t border-slate-100 text-center">
+          <Link
             href="/login"
-            className="text-blue-600 font-semibold hover:underline"
+            className="text-xs font-bold text-slate-600 hover:text-slate-900 transition"
           >
-            Login
-          </a>
-        </p>
-
+            Remember your password? Sign In
+          </Link>
+        </div>
       </div>
-    </div>
+    </main>
   );
 }

@@ -1,29 +1,92 @@
 "use client";
 
-import { useEffect, useState } from "react";
-
+import { useEffect, useState, useMemo } from "react";
 import { supabase } from "../../lib/supabase";
-import { useRouter } from "next/navigation";
+import { getDistanceFromLatLonInKm } from "@/lib/geo";
+import { KOLKATA_ZONES } from "@/lib/zones";
 
-const ADMIN_UID = "8c45b8fe-6c06-4ff4-897d-90864bd8606b";
+import SopAuditDrawer from "../components/SopAuditDrawer";
+import { useRouter } from "next/navigation";
+import Image from "next/image";
+import Link from "next/link";
+
+const getCurrentBillingCycle = () => {
+  const now = new Date();
+  const dayOfWeek = now.getDay();
+  const currentHour = now.getHours();
+  const isSundayAfter8PM = dayOfWeek === 0 && currentHour >= 20;
+
+  const monday = new Date(now);
+  let daysToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
+
+  if (isSundayAfter8PM) {
+    monday.setDate(now.getDate() + 1);
+  } else {
+    monday.setDate(now.getDate() - daysToMonday);
+  }
+
+  const sunday = new Date(monday);
+  sunday.setDate(monday.getDate() + 6);
+
+  const disbursementMonday = new Date(sunday);
+  disbursementMonday.setDate(sunday.getDate() + 1);
+
+  const formatDate = (d: Date) => d.toISOString().split("T")[0];
+
+  return {
+    cycleStartStr: formatDate(monday),
+    cycleEndStr: formatDate(sunday),
+    isPastSundayCutoff: isSundayAfter8PM,
+    cycleLabel: `${monday.toLocaleDateString("en-IN", { month: "short", day: "numeric" })} – ${sunday.toLocaleDateString("en-IN", { month: "short", day: "numeric" })}`,
+    disbursementDateStr: formatDate(disbursementMonday),
+  };
+};
+
+const ADMIN_UIDS = [
+  "8c45b8fe-6c06-4ff4-897d-90864bd8606b",
+  "bdefbf81-2d1d-4b1b-8466-a3b64e721158",
+];
+
+type Partner = {
+  id: string;
+  user_id: string;
+  partner_type: string;
+  full_name: string;
+  business_name: string | null;
+  phone: string;
+  email: string;
+  address: string;
+  status: string;
+  verification_status: string;
+  operating_zone?: string;
+  is_available?: boolean;
+  in_hand_cash?: number;
+  current_lat?: number | null;
+  current_lng?: number | null;
+  total_washes_completed?: number;
+  avg_wash_time_minutes?: number;
+};
+
+interface PartnerPayoutSummary {
+  partner_id: string;
+  partner_name: string;
+  partner_phone: string;
+  pending_amount: number;
+  pending_washes: number;
+}
 
 const formatTimeRange = (time: string) => {
   if (!time) return "";
-
   const [hour, minute] = time.slice(0, 5).split(":").map(Number);
-
   const startMinutes = hour * 60 + minute;
   const endMinutes = startMinutes + 30;
 
   const formatTime = (totalMinutes: number) => {
     let h = Math.floor(totalMinutes / 60);
     const m = totalMinutes % 60;
-
     const period = h >= 12 ? "PM" : "AM";
-
     if (h === 0) h = 12;
     else if (h > 12) h -= 12;
-
     return `${h}:${m.toString().padStart(2, "0")} ${period}`;
   };
 
@@ -32,315 +95,379 @@ const formatTimeRange = (time: string) => {
 
 export default function AdminPage() {
   const [bookings, setBookings] = useState<any[]>([]);
-const [isAdmin, setIsAdmin] = useState(false);
-const [checking, setChecking] = useState(true);
-const [newBookingAlert, setNewBookingAlert] = useState<any | null>(null);
+  const [partners, setPartners] = useState<Partner[]>([]);
+  const [reviews, setReviews] = useState<Record<string, any>>({});
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [checking, setChecking] = useState(true);
+  const [newBookingAlert, setNewBookingAlert] = useState<any | null>(null);
+  const [selectedBookingForAudit, setSelectedBookingForAudit] = useState<any | null>(null);
 
-const [searchTerm, setSearchTerm] = useState("");
-const [statusFilter, setStatusFilter] = useState("All");
-const [statusMessage,setStatusMessage] = useState("");
-const [paymentFilter, setPaymentFilter] = useState("All");
-const [sortOrder, setSortOrder] = useState("Newest");
-const [dateFilter, setDateFilter] = useState("All");
-const [customDate, setCustomDate] = useState("");
+  const [searchTerm, setSearchTerm] = useState("");
+  const [statusFilter, setStatusFilter] = useState("All");
+  const [paymentFilter, setPaymentFilter] = useState("All");
+  const [zoneFilter, setZoneFilter] = useState("All");
+  const [sortOrder, setSortOrder] = useState("Newest");
+  const [dateFilter, setDateFilter] = useState("All");
+  const [customDate, setCustomDate] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
 
-const router = useRouter();
+  // Partner Weekly Payout States
+  const [payoutSummaries, setPayoutSummaries] = useState<PartnerPayoutSummary[]>([]);
+  const [settlingPartnerId, setSettlingPartnerId] = useState<string | null>(null);
+  const [purgingBookings, setPurgingBookings] = useState(false);
 
-const filteredBookings = bookings.filter((booking) => {
-  const search = searchTerm.toLowerCase();
+  const router = useRouter();
+  const today = new Date().toISOString().split("T")[0];
 
-  const matchesSearch =
-    booking.name?.toLowerCase().includes(search) ||
-    booking.phone?.toLowerCase().includes(search) ||
-    booking.car_number?.toLowerCase().includes(search) ||
-    booking.service?.toLowerCase().includes(search);
+  // Billing Cycle Information (Monday 06:00 AM – Sunday 08:00 PM)
+  const cycleInfo = useMemo(() => getCurrentBillingCycle(), []);
 
-  const matchesStatus =
-  statusFilter === "All" ||
-  booking.status === statusFilter;
+  // Check whether current time is past Sunday 8:00 PM (enables settlement button)
+  const isSettlementWindowOpen = useMemo(() => {
+    const now = new Date();
+    const day = now.getDay(); // 0 is Sunday
+    const hour = now.getHours();
+    return (day === 0 && hour >= 20) || day === 1; // Open Sunday after 8:00 PM and throughout Monday
+  }, []);
 
-const matchesDate =
-  dateFilter === "All"
-    ? true
-    : dateFilter === "Custom"
-    ? booking.date === customDate
-    : booking.date === dateFilter;
+  const fetchPendingPayouts = async (partnersList?: Partner[]) => {
+    try {
+      const activePartners = partnersList || partners;
+      const { data: completedBookings, error } = await supabase
+        .from("booking")
+        .select("*")
+        .eq("status", "Completed")
+        .or("payout_status.eq.pending,payout_status.is.null");
 
+      if (error || !completedBookings) return;
 
+      const summaryMap: Record<string, PartnerPayoutSummary> = {};
 
-  const bookingPaymentStatus = booking.payment_status || "Unpaid";
+      completedBookings.forEach((b: any) => {
+        const partnerIdentifier = b.assigned_partner_id;
+        if (!partnerIdentifier) return;
 
-const matchesPayment =
-  paymentFilter === "All" ||
-  bookingPaymentStatus === paymentFilter;
+        const payout =
+          Number(b.partner_payout) ||
+          Math.round(Number(b.price || 499) * 0.70);
 
-return matchesSearch && matchesStatus && matchesPayment && matchesDate;
-});
-
-const sortedBookings = [...filteredBookings].sort((a, b) => {
-  const dateA = new Date(`${a.date}T${a.time}`).getTime();
-  const dateB = new Date(`${b.date}T${b.time}`).getTime();
-
-  return sortOrder === "Newest"
-    ? dateB - dateA
-    : dateA - dateB;
-});
-const totalRevenue = bookings
-  .filter(
-    (booking) =>
-      booking.status === "Completed" &&
-      booking.payment_status === "Paid"
-  )
-  .reduce((total, booking) => total + (Number(booking.price) || 0), 0);
-
-  const totalPaid = bookings
-  .filter((booking) => booking.payment_status === "Paid")
-  .reduce((total, booking) => total + (Number(booking.price) || 0), 0);
-
-const totalUnpaid = bookings
-  .filter((booking) => booking.payment_status !== "Paid")
-  .reduce((total, booking) => total + (Number(booking.price) || 0), 0);
-
-const today = new Date().toISOString().split("T")[0];
-
-const todayBookings = bookings.filter(
-  (booking) => booking.date === today
-);
-
-const todayRevenue = todayBookings
-  .filter(
-    (booking) =>
-      booking.status === "Completed" &&
-      booking.payment_status === "Paid"
-  )
-  .reduce((total, booking) => total + (Number(booking.price) || 0), 0);
-  const bookingOverview = {
-  pending: bookings.filter((booking) => booking.status === "Pending").length,
-  confirmed: bookings.filter((booking) => booking.status === "Confirmed").length,
-  completed: bookings.filter((booking) => booking.status === "Completed").length,
-  cancelled: bookings.filter((booking) => booking.status === "Cancelled").length,
-
-};
-const hasPendingBookings = bookingOverview.pending > 0;
-const upcomingBookings = Array.from(
-  new Map(
-    bookings
-      .filter(
-        (booking) =>
-          booking.date > today &&
-          booking.status !== "Cancelled" &&
-          booking.status !== "Completed"
-      )
-      .map((booking) => [booking.id, booking])
-  ).values()
-).sort((a, b) => {
-  const dateA = new Date(`${a.date}T${a.time}`).getTime();
-  const dateB = new Date(`${b.date}T${b.time}`).getTime();
-
-  return dateA - dateB;
-});
-
-const todayActiveBookings = bookings.filter(
-  (booking) =>
-    booking.date === today &&
-    booking.status !== "Cancelled" &&
-    booking.status !== "Completed"
-);
-
-  useEffect(() => {
-  let channel: ReturnType<typeof supabase.channel> | null = null;
-  let isMounted = true;
-
-  const checkAdminAndLoadBookings = async () => {
-    setChecking(true);
-
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-
-    // No logged-in user
-    if (!user) {
-      if (!isMounted) return;
-
-      setChecking(false);
-      router.replace("/login");
-      return;
-    }
-
-    // Normal customer → deny access
-    if (user.id !== ADMIN_UID) {
-      if (!isMounted) return;
-
-      setIsAdmin(false);
-      setChecking(false);
-      return;
-    }
-
-    // Admin verified
-    if (!isMounted) return;
-
-    setIsAdmin(true);
-
-    const { data, error } = await supabase
-      .from("booking")
-      .select("*")
-      .order("created_at", { ascending: false });
-
-    if (error) {
-      console.error(error);
-
-      if (isMounted) {
-        setChecking(false);
-      }
-
-      return;
-    }
-
-    if (!isMounted) return;
-
-    // Remove duplicate booking IDs
-    const uniqueBookings = Array.from(
-      new Map(
-        (data || []).map((booking) => [
-          booking.id,
-          booking,
-        ])
-      ).values()
-    );
-
-    setBookings(uniqueBookings);
-    setChecking(false);
-
-    // Create realtime channel only while component is mounted
-    channel = supabase.channel(
-      `admin-new-bookings-${Date.now()}-${Math.random()}`
-    );
-
-    channel.on(
-      "postgres_changes",
-      {
-        event: "INSERT",
-        schema: "public",
-        table: "booking",
-      },
-      (payload) => {
-        if (!isMounted) return;
-
-        const newBooking = payload.new;
-
-        setBookings((currentBookings) => {
-          const alreadyExists = currentBookings.some(
-            (booking) => booking.id === newBooking.id
+        if (!summaryMap[partnerIdentifier]) {
+          const matched = activePartners.find(
+            (p) => p.user_id === partnerIdentifier || p.id === partnerIdentifier
           );
 
-          if (alreadyExists) {
-            return currentBookings;
-          }
+          summaryMap[partnerIdentifier] = {
+            partner_id: partnerIdentifier,
+            partner_name: matched?.full_name || `Partner (${partnerIdentifier.slice(0, 8)})`,
+            partner_phone: matched?.phone || "N/A",
+            pending_amount: 0,
+            pending_washes: 0,
+          };
+        }
 
-          return [newBooking, ...currentBookings];
-        });
+        summaryMap[partnerIdentifier].pending_amount += payout;
+        summaryMap[partnerIdentifier].pending_washes += 1;
+      });
 
-        setNewBookingAlert(newBooking);
-
-        setTimeout(() => {
-          if (isMounted) {
-            setNewBookingAlert(null);
-          }
-        }, 5000);
-      }
-    );
-
-    channel.on(
-  "postgres_changes",
-  {
-    event: "UPDATE",
-    schema: "public",
-    table: "booking",
-  },
-  (payload) => {
-    if (!isMounted) return;
-
-    setBookings((currentBookings) =>
-      currentBookings.map((booking) =>
-        booking.id === payload.new.id
-          ? payload.new
-          : booking
-      )
-    );
-  }
-);
-
-channel.on(
-  "postgres_changes",
-  {
-    event: "DELETE",
-    schema: "public",
-    table: "booking",
-  },
-  (payload) => {
-    if (!isMounted) return;
-
-    setBookings((currentBookings) =>
-      currentBookings.filter(
-        (booking) => booking.id !== payload.old.id
-      )
-    );
-  }
-);
-
-await channel.subscribe();
-  };
-
-  checkAdminAndLoadBookings();
-
-  return () => {
-    isMounted = false;
-
-    if (channel) {
-      supabase.removeChannel(channel);
-      channel = null;
+      setPayoutSummaries(Object.values(summaryMap));
+    } catch (err) {
+      console.error("Failed to load payout summaries:", err);
     }
   };
-}, [router]);
-      
 
+  useEffect(() => {
+    let channel: ReturnType<typeof supabase.channel> | null = null;
+    let isMounted = true;
 
-  // Loading
+    const checkAdminAndLoadData = async () => {
+      setChecking(true);
+
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+
+      if (!user) {
+        if (!isMounted) return;
+        setChecking(false);
+        router.replace("/login");
+        return;
+      }
+
+      if (!ADMIN_UIDS.includes(user.id)) {
+        if (!isMounted) return;
+        setIsAdmin(false);
+        setChecking(false);
+        return;
+      }
+
+      if (!isMounted) return;
+      setIsAdmin(true);
+
+      const { data: bookingsData } = await supabase
+        .from("booking")
+        .select("*")
+        .order("created_at", { ascending: false });
+
+      if (bookingsData && isMounted) {
+        const unique = Array.from(
+          new Map(bookingsData.map((b) => [b.id, b])).values()
+        );
+        setBookings(unique);
+      }
+
+      const { data: partnerData } = await supabase
+        .from("partner_profiles")
+        .select("*")
+        .eq("status", "Approved")
+        .eq("verification_status", "verified")
+        .order("is_available", { ascending: false });
+
+      if (partnerData && isMounted) {
+        setPartners(partnerData as Partner[]);
+        fetchPendingPayouts(partnerData as Partner[]);
+      }
+
+      const { data: reviewData } = await supabase
+        .from("booking_reviews")
+        .select("*");
+
+      if (reviewData && isMounted) {
+        const revMap: Record<string, any> = {};
+        reviewData.forEach((r) => {
+          revMap[r.booking_id] = r;
+        });
+        setReviews(revMap);
+      }
+
+      setChecking(false);
+
+      channel = supabase.channel(`admin-live-${Date.now()}`);
+
+      channel
+        .on(
+          "postgres_changes",
+          { event: "INSERT", schema: "public", table: "booking" },
+          (payload) => {
+            if (!isMounted) return;
+            const newB = payload.new;
+            setBookings((curr) => [newB, ...curr.filter((b) => b.id !== newB.id)]);
+            setNewBookingAlert(newB);
+            setTimeout(() => {
+              if (isMounted) setNewBookingAlert(null);
+            }, 6000);
+          }
+        )
+        .on(
+          "postgres_changes",
+          { event: "UPDATE", schema: "public", table: "booking" },
+          (payload) => {
+            if (!isMounted) return;
+            const updated = payload.new;
+
+            setBookings((curr) =>
+              curr.map((b) => (b.id === updated.id ? updated : b))
+            );
+
+            fetchPendingPayouts();
+
+            setSelectedBookingForAudit((curr: any) =>
+              curr?.id === updated.id ? updated : curr
+            );
+          }
+        )
+        .on(
+          "postgres_changes",
+          { event: "DELETE", schema: "public", table: "booking" },
+          (payload) => {
+            if (!isMounted) return;
+            setBookings((curr) => curr.filter((b) => b.id !== payload.old.id));
+            fetchPendingPayouts();
+          }
+        )
+        .subscribe();
+    };
+
+    checkAdminAndLoadData();
+
+    return () => {
+      isMounted = false;
+      if (channel) supabase.removeChannel(channel);
+    };
+  }, [router]);
+
+  const handleSettlePartner = async (summary: PartnerPayoutSummary) => {
+    if (!isSettlementWindowOpen) {
+      alert("Settlement Window Locked: Payouts can only be marked as settled after Sunday 8:00 PM.");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Confirm weekly payout of ₹${summary.pending_amount} for ${summary.partner_name} (${summary.pending_washes} washes)?\n\nEnsure NEFT/Bank transfer has been executed to the partner's registered bank account.`
+    );
+    if (!confirmed) return;
+
+    setSettlingPartnerId(summary.partner_id);
+
+    try {
+      const { error } = await supabase
+        .from("booking")
+        .update({ payout_status: "settled" })
+        .eq("assigned_partner_id", summary.partner_id)
+        .eq("status", "Completed")
+        .or("payout_status.eq.pending,payout_status.is.null");
+
+      if (error) throw error;
+
+      setStatusMessage(`Settled ₹${summary.pending_amount} for ${summary.partner_name}!`);
+      setTimeout(() => setStatusMessage(""), 4000);
+      await fetchPendingPayouts();
+    } catch (err: any) {
+      alert("Settlement update failed: " + err.message);
+    } finally {
+      setSettlingPartnerId(null);
+    }
+  };
+
+  // Rule 1: 1-Click Complete Storage Purge for Past Week's Completed Bookings
+  const handlePurgeOldCompletedBookings = async () => {
+    const cutoffDate = cycleInfo.cycleStartStr; // Bookings before the active Monday cycle
+    const confirmed = window.confirm(
+      `Permanent Storage Cleanup:\nAre you sure you want to delete all COMPLETED bookings before ${cutoffDate} (Sunday 8:00 PM Cutoff)?\n\nThis will free up database storage.`
+    );
+
+    if (!confirmed) return;
+
+    setPurgingBookings(true);
+    try {
+      const { error } = await supabase
+        .from("booking")
+        .delete()
+        .eq("status", "Completed")
+        .lt("date", cutoffDate);
+
+      if (error) throw error;
+
+      alert(`Historical completed bookings prior to ${cutoffDate} successfully purged from storage.`);
+      setBookings((prev) =>
+        prev.filter((b) => !(b.status === "Completed" && b.date < cutoffDate))
+      );
+      await fetchPendingPayouts();
+    } catch (err: any) {
+      alert("Purge failed: " + err.message);
+    } finally {
+      setPurgingBookings(false);
+    }
+  };
+
+  const assignPartner = async (bookingId: string, partnerId: string) => {
+    if (!partnerId) return;
+
+    const { error: offerErr } = await supabase.from("booking_offers").insert({
+      booking_id: bookingId,
+      partner_id: partnerId,
+      status: "pending",
+      offered_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 60 * 1000).toISOString(),
+    });
+
+    if (offerErr) {
+      alert("Failed to send dispatch offer: " + offerErr.message);
+      return;
+    }
+
+    await supabase
+      .from("booking")
+      .update({
+        status: "Pending",
+        assigned_partner_id: partnerId,
+      })
+      .eq("id", bookingId);
+
+    setBookings((curr) =>
+      curr.map((b) =>
+        b.id === bookingId
+          ? { ...b, assigned_partner_id: partnerId, status: "Pending" }
+          : b
+      )
+    );
+
+    setStatusMessage("Dispatch offer sent! Awaiting partner response (60s)...");
+    setTimeout(() => setStatusMessage(""), 3500);
+  };
+
+  const handleAuditPhotoUpdate = (updatedBooking: any) => {
+    setBookings((curr) =>
+      curr.map((b) => (b.id === updatedBooking.id ? updatedBooking : b))
+    );
+    setSelectedBookingForAudit(updatedBooking);
+  };
+
+  const filteredBookings = bookings.filter((b) => {
+    const term = searchTerm.toLowerCase();
+    const matchSearch =
+      b.name?.toLowerCase().includes(term) ||
+      b.phone?.toLowerCase().includes(term) ||
+      b.car_number?.toLowerCase().includes(term) ||
+      b.service?.toLowerCase().includes(term);
+
+    const matchStatus = statusFilter === "All" || b.status === statusFilter;
+    const matchPayment =
+      paymentFilter === "All" || (b.payment_status || "Unpaid") === paymentFilter;
+    const matchZone = zoneFilter === "All" || b.booking_zone === zoneFilter;
+
+    const matchDate =
+      dateFilter === "All"
+        ? true
+        : dateFilter === "Custom"
+        ? b.date === customDate
+        : b.date === dateFilter;
+
+    return matchSearch && matchStatus && matchPayment && matchZone && matchDate;
+  });
+
+  const sortedBookings = [...filteredBookings].sort((a, b) => {
+    const timeA = new Date(`${a.date}T${a.time || "00:00"}`).getTime();
+    const timeB = new Date(`${b.date}T${b.time || "00:00"}`).getTime();
+    return sortOrder === "Newest" ? timeB - timeA : timeA - timeB;
+  });
+
+  const totalRevenue = bookings
+    .filter((b) => b.status === "Completed" && b.payment_status === "Paid")
+    .reduce((sum, b) => sum + (Number(b.price) || 0), 0);
+
+  const pendingCount = bookings.filter((b) => b.status === "Pending").length;
+  const activeCount = bookings.filter((b) =>
+    ["Confirmed", "On the way", "Arrived", "Washing"].includes(b.status)
+  ).length;
+  const cancelledCount = bookings.filter((b) => b.status === "Cancelled").length;
+
   if (checking) {
     return (
-      <main className="min-h-screen flex items-center justify-center bg-gray-50">
-        <div className="bg-white px-8 py-6 rounded-2xl shadow-md text-center">
-          <div className="text-4xl mb-3">🔐</div>
-
-          <p className="text-gray-700 font-semibold">
-            Checking admin access...
+      <main className="min-h-screen flex items-center justify-center bg-slate-50">
+        <div className="bg-white p-6 rounded-3xl border border-orange-100 shadow-xl text-center">
+          <div className="w-10 h-10 border-4 border-rose-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+          <p className="text-xs font-black text-slate-700 tracking-wider uppercase">
+            Verifying Executive Clearance...
           </p>
         </div>
       </main>
     );
   }
 
-  // Access denied
-  // Access denied
   if (!isAdmin) {
     return (
-      <main className="min-h-screen bg-gray-50 p-4 sm:p-8">
-        <div className="max-w-2xl mx-auto bg-white rounded-2xl shadow-md border border-red-100 p-8 text-center">
-          <div className="text-5xl mb-4">🔒</div>
-
-          <h1 className="text-2xl font-bold text-red-600">
-            Access Denied
-          </h1>
-
-          <p className="text-gray-600 mt-2">
-            You do not have permission to access the Admin Dashboard.
+      <main className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+        <div className="max-w-md w-full bg-white rounded-3xl p-8 border border-rose-100 shadow-xl text-center space-y-4">
+          <div className="text-5xl">🔒</div>
+          <h1 className="text-xl font-black text-slate-900">Restricted Admin Zone</h1>
+          <p className="text-xs text-slate-500 leading-relaxed">
+            This terminal requires verified administrative permissions for Fooka Wash dispatch.
           </p>
-
           <button
             onClick={() => router.push("/")}
-            className="mt-6 px-6 py-3 bg-blue-600 text-white rounded-xl font-semibold hover:bg-blue-700"
+            className="w-full py-3 bg-gradient-to-r from-orange-500 to-rose-600 text-white font-extrabold text-xs uppercase tracking-wider rounded-2xl hover:opacity-90 shadow-md shadow-orange-500/20 transition"
           >
-            Go to Home
+            Return to App
           </button>
         </div>
       </main>
@@ -348,799 +475,549 @@ await channel.subscribe();
   }
 
   return (
-    <main className="min-h-screen bg-gray-50 p-4 sm:p-8">
-
-      {/* Header */}
-<div className="max-w-6xl mx-auto mb-8">
-  <h1 className="text-3xl sm:text-4xl font-bold text-blue-600">
-    Admin Dashboard
-  </h1>
-
-  <p className="text-gray-500 mt-2">
-    Manage customer bookings
-  </p>
-  {newBookingAlert && (
-  <div className="mt-4 bg-blue-50 border border-blue-200 rounded-2xl p-4 shadow-sm">
-    <div className="flex items-start justify-between gap-3">
-      <div>
-        <p className="text-blue-800 font-bold text-lg">
-          🔔 New Booking Received!
-        </p>
-
-        <p className="text-gray-700 mt-2">
-          <strong>{newBookingAlert.name}</strong> booked{" "}
-          <strong>{newBookingAlert.service}</strong>
-        </p>
-
-        <p className="text-sm text-gray-600 mt-1">
-          🚗 {newBookingAlert.car_number} •{" "}
-          {newBookingAlert.date} •{" "}
-          {formatTimeRange(newBookingAlert.time)}
-        </p>
-
-        <p className="text-sm font-bold text-green-600 mt-1">
-          ₹{newBookingAlert.price}
-        </p>
-      </div>
-
-      <button
-        onClick={() => setNewBookingAlert(null)}
-        className="text-gray-500 hover:text-gray-800 font-bold text-xl"
-        aria-label="Close notification"
-      >
-        ×
-      </button>
-    </div>
-
-    <button
-      onClick={() => {
-        setSearchTerm(newBookingAlert.name);
-        setStatusFilter("All");
-        setPaymentFilter("All");
-        setDateFilter("All");
-        setCustomDate("");
-        setSortOrder("Newest");
-        setNewBookingAlert(null);
-
-        window.scrollTo({
-          top: document.body.scrollHeight,
-          behavior: "smooth",
-        });
-      }}
-      className="mt-3 bg-blue-600 text-white px-4 py-2 rounded-lg font-semibold hover:bg-blue-700 transition"
-    >
-      View Booking
-    </button>
-  </div>
-)}
-
-  {hasPendingBookings && (
-  <div className="mt-4 bg-yellow-50 border border-yellow-200 text-yellow-800 px-4 py-3 rounded-xl font-semibold">
-    <div>
-      🔔 You have {bookingOverview.pending} pending booking
-      {bookingOverview.pending !== 1 ? "s" : ""} waiting for confirmation.
-    </div>
-
-    <button
-      onClick={() => {
-        setStatusFilter("Pending");
-        setSearchTerm("");
-        setPaymentFilter("All");
-        setDateFilter("All");
-        setCustomDate("");
-        setSortOrder("Newest");
-        window.scrollTo({
-          top: document.body.scrollHeight,
-          behavior: "smooth",
-        });
-      }}
-      className="mt-3 bg-yellow-600 text-white px-4 py-2 rounded-lg font-semibold hover:bg-yellow-700 transition"
-    >
-      View Pending Bookings
-    </button>
-  </div>
-)}
-</div>
-
-      {/* Check admin */}
-      {bookings.length === 0 ? (
-        <div className="max-w-6xl mx-auto">
-
-          <div className="bg-white rounded-2xl shadow-md border border-gray-100 p-8 text-center">
-            <div className="text-5xl mb-3">📋</div>
-
-            <h2 className="text-xl font-bold text-gray-800">
-              No bookings yet
-            </h2>
-
-            <p className="text-gray-500 mt-2">
-              Customer bookings will appear here.
-            </p>
-          </div>
-
-        </div>
-      ) : (
-        <div className="max-w-6xl mx-auto">
-
-          {/* Statistics */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-
-            <div className="p-5 rounded-2xl bg-white shadow-md border border-gray-100">
-              <h2 className="text-gray-500 font-semibold">
-                Total
-              </h2>
-
-              <p className="text-2xl font-bold text-gray-800 mt-1">
-                {bookings.length}
-              </p>
+    <main className="min-h-screen bg-[#fafafc] text-slate-900 p-4 sm:p-8 select-none">
+      <div className="max-w-7xl mx-auto space-y-6">
+        {/* Navigation & Brand Header */}
+        <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white/90 backdrop-blur-md p-5 rounded-3xl border border-rose-100 shadow-sm">
+          <div className="flex items-center gap-3">
+            <div className="relative w-10 h-10 rounded-2xl overflow-hidden border border-orange-200 shadow-sm flex-shrink-0">
+              <Image src="/icon-192.png" alt="FOOKA" fill className="object-cover" />
             </div>
-
-            <div className="p-5 rounded-2xl bg-white shadow-md border border-yellow-200">
-              <h2 className="text-gray-500 font-semibold">
-                Pending
-              </h2>
-
-              <p className="text-2xl font-bold text-yellow-600 mt-1">
-                {
-                  bookings.filter(
-                    (b) => b.status === "Pending"
-                  ).length
-                }
-              </p>
-            </div>
-
-            <div className="p-5 rounded-2xl bg-white shadow-md border border-blue-200">
-              <h2 className="text-gray-500 font-semibold">
-                Confirmed
-              </h2>
-
-              <p className="text-2xl font-bold text-blue-600 mt-1">
-                {
-                  bookings.filter(
-                    (b) => b.status === "Confirmed"
-                  ).length
-                }
-              </p>
-            </div>
-
-            <div className="p-5 rounded-2xl bg-white shadow-md border border-green-200">
-              <h2 className="text-gray-500 font-semibold">
-                Completed
-              </h2>
-
-              <p className="text-2xl font-bold text-green-600 mt-1">
-                {
-                  bookings.filter(
-                    (b) => b.status === "Completed"
-                  ).length
-                }
-              </p>
-            </div>
-
-            <div className="p-5 rounded-2xl bg-white shadow-md border border-red-200">
-              <h2 className="text-gray-500 font-semibold">
-                Cancelled
-              </h2>
-
-              <p className="text-2xl font-bold text-red-600 mt-1">
-                {
-                  bookings.filter(
-                    (b) => b.status === "Cancelled"
-                  ).length
-                }
-              </p>
-            </div>
-            <div className="p-5 rounded-2xl bg-white shadow-md border border-green-200">
-  <h2 className="text-gray-500 font-semibold">
-    Revenue
-  </h2>
-
-  <p className="text-2xl font-bold text-green-600 mt-1">
-    ₹{totalRevenue}
-  </p>
-</div>
-
-<div className="p-5 rounded-2xl bg-white shadow-md border border-blue-200">
-  <h2 className="text-gray-500 font-semibold">
-    Today's Bookings
-  </h2>
-
-  <p className="text-2xl font-bold text-blue-600 mt-1">
-    {todayBookings.length}
-  </p>
-</div>
-
-<div className="p-5 rounded-2xl bg-white shadow-md border border-purple-200">
-  <h2 className="text-gray-500 font-semibold">
-    Today's Revenue
-  </h2>
-
-  <p className="text-2xl font-bold text-purple-600 mt-1">
-    ₹{todayRevenue}
-  </p>
-</div>
-
-<div className="p-5 rounded-2xl bg-white shadow-md border border-green-200">
-  <h2 className="text-gray-500 font-semibold">
-    Total Paid
-  </h2>
-
-  <p className="text-2xl font-bold text-green-600 mt-1">
-    ₹{totalPaid}
-  </p>
-</div>
-
-<div className="p-5 rounded-2xl bg-white shadow-md border border-yellow-200">
-  <h2 className="text-gray-500 font-semibold">
-    Total Unpaid
-  </h2>
-
-  <p className="text-2xl font-bold text-yellow-600 mt-1">
-    ₹{totalUnpaid}
-  </p>
-</div>
-
-          </div>
-
-          {/* Booking Overview */}
-<div className="mb-8 bg-white rounded-2xl shadow-md border border-gray-100 p-5">
-  <h2 className="text-xl font-bold text-gray-800 mb-4">
-    Booking Overview
-  </h2>
-
-  <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-    <div className="bg-yellow-50 rounded-xl p-4 text-center">
-      <p className="text-sm font-semibold text-yellow-700">
-        Pending
-      </p>
-      <p className="text-2xl font-bold text-yellow-600 mt-1">
-        {bookingOverview.pending}
-      </p>
-    </div>
-
-    <div className="bg-blue-50 rounded-xl p-4 text-center">
-      <p className="text-sm font-semibold text-blue-700">
-        Confirmed
-      </p>
-      <p className="text-2xl font-bold text-blue-600 mt-1">
-        {bookingOverview.confirmed}
-      </p>
-    </div>
-
-    <div className="bg-green-50 rounded-xl p-4 text-center">
-      <p className="text-sm font-semibold text-green-700">
-        Completed
-      </p>
-      <p className="text-2xl font-bold text-green-600 mt-1">
-        {bookingOverview.completed}
-      </p>
-    </div>
-
-    <div className="bg-red-50 rounded-xl p-4 text-center">
-      <p className="text-sm font-semibold text-red-700">
-        Cancelled
-      </p>
-      <p className="text-2xl font-bold text-red-600 mt-1">
-        {bookingOverview.cancelled}
-      </p>
-    </div>
-  </div>
-</div>
-
-{/* Today's Active Bookings */}
-<div className="mb-8 bg-white rounded-2xl shadow-md border border-gray-100 p-5">
-  <h2 className="text-xl font-bold text-gray-800 mb-4">
-    Today's Active Bookings
-  </h2>
-
-  {todayActiveBookings.length === 0 ? (
-    <p className="text-gray-500 text-center py-6">
-      No active bookings for today.
-    </p>
-  ) : (
-    <div className="space-y-3">
-      {todayActiveBookings
-        .sort((a, b) => {
-          const dateA = new Date(`${a.date}T${a.time}`).getTime();
-          const dateB = new Date(`${b.date}T${b.time}`).getTime();
-          return dateA - dateB;
-        })
-        .map((item) => (
-          <div
-            key={item.id}
-            className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 p-4 bg-gray-50 rounded-xl border border-gray-100"
-          >
             <div>
-              <p className="font-bold text-gray-800">
-                {item.name}
-              </p>
-
-              <p className="text-sm text-gray-600">
-                🚗 {item.car_number} • {item.service}
-              </p>
-            </div>
-
-            <div className="text-sm sm:text-right">
-  <p className="font-semibold text-blue-600">
-    {formatTimeRange(item.time)}
-  </p>
-
-  <span
-    className={`inline-block mt-1 px-3 py-1 rounded-full text-xs font-bold ${
-      item.status === "Pending"
-        ? "bg-yellow-100 text-yellow-700"
-        : "bg-blue-100 text-blue-700"
-    }`}
-  >
-    {item.status}
-  </span>
-
-  <button
-    onClick={() => {
-      setSearchTerm(item.name);
-      window.scrollTo({
-        top: document.body.scrollHeight,
-        behavior: "smooth",
-      });
-    }}
-    className="mt-2 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 transition"
-  >
-    Manage Booking
-  </button>
-</div>
-          </div>
-        ))}
-    </div>
-  )}
-</div>
-
-{/* Upcoming Bookings */}
-<div className="mb-8 bg-white rounded-2xl shadow-md border border-gray-100 p-5">
-  <h2 className="text-xl font-bold text-gray-800 mb-4">
-    Upcoming Bookings
-  </h2>
-
-  {upcomingBookings.length === 0 ? (
-    <p className="text-gray-500 text-center py-6">
-      No upcoming bookings.
-    </p>
-  ) : (
-    <div className="space-y-3">
-      {upcomingBookings.slice(0, 5).map((item) => (
-  <div
-    key={item.id}
-    className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 p-4 bg-gray-50 rounded-xl border border-gray-100"
-  >
-          <div>
-            <p className="font-bold text-gray-800">
-              {item.name}
-            </p>
-            {item.car_company && item.car_model && (
-  <p className="text-sm text-gray-600 mt-2">
-    🚘 {item.car_company} {item.car_model}
-  </p>
-)}
-
-            <p className="text-sm text-gray-600">
-              🚗 {item.car_number} • {item.service}
-            </p>
-          </div>
-
-          <div className="text-sm sm:text-right">
-  <p className="font-semibold text-blue-600">
-    {item.date}
-  </p>
-
-  <p className="text-gray-600">
-    {formatTimeRange(item.time)}
-  </p>
-
-  <button
-    onClick={() => {
-      setSearchTerm(item.name);
-      window.scrollTo({
-        top: document.body.scrollHeight,
-        behavior: "smooth",
-      });
-    }}
-    className="mt-2 bg-blue-600 text-white px-3 py-2 rounded-lg text-sm font-semibold hover:bg-blue-700 transition"
-  >
-    Manage Booking
-  </button>
-</div>
-        </div>
-      ))}
-    </div>
-  )}
-</div>
-
-{/* Search & Filter */}
-<div className="mb-8 bg-white rounded-2xl shadow-md border border-gray-100 p-5">
-  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-
-    <div>
-      <label className="block text-sm font-semibold text-gray-700 mb-2">
-        Search Bookings
-      </label>
-
-      <input
-        type="text"
-        placeholder="Search by name, phone, car number or service..."
-        value={searchTerm}
-        onChange={(e) => setSearchTerm(e.target.value)}
-        className="w-full px-4 py-3 border border-gray-300 rounded-xl bg-white text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
-      />
-    </div>
-
-    <div>
-      <label className="block text-sm font-semibold text-gray-700 mb-2">
-        Filter by Status
-      </label>
-
-      <select
-        value={statusFilter}
-        onChange={(e) => setStatusFilter(e.target.value)}
-        className="w-full px-4 py-3 border border-gray-300 rounded-xl bg-white text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
-      >
-        <option value="All">All Statuses</option>
-        <option value="Pending">Pending</option>
-        <option value="Confirmed">Confirmed</option>
-        <option value="Completed">Completed</option>
-        <option value="Cancelled">Cancelled</option>
-      </select>
-    </div>
-<div>
-  <label className="block text-sm font-semibold text-gray-700 mb-2">
-    Filter by Payment
-  </label>
-
-  <select
-    value={paymentFilter}
-    onChange={(e) => setPaymentFilter(e.target.value)}
-    className="w-full px-4 py-3 border border-gray-300 rounded-xl bg-white text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
-  >
-    <option value="All">All Payments</option>
-    <option value="Unpaid">Unpaid</option>
-    <option value="Paid">Paid</option>
-  </select>
-</div>
-
-<div>
-  <label className="block text-sm font-semibold text-gray-700 mb-2">
-    Sort Bookings
-  </label>
-
-  <select
-    value={sortOrder}
-    onChange={(e) => setSortOrder(e.target.value)}
-    className="w-full px-4 py-3 border border-gray-300 rounded-xl bg-white text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
-  >
-    <option value="Newest">Newest First</option>
-    <option value="Oldest">Oldest First</option>
-  </select>
-</div>
-
-<div>
-  <label className="block text-sm font-semibold text-gray-700 mb-2">
-    Filter by Date
-  </label>
-
-  <select
-    value={dateFilter}
-    onChange={(e) => setDateFilter(e.target.value)}
-    className="w-full px-4 py-3 border border-gray-300 rounded-xl bg-white text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
-  >
-    <option value="All">All Dates</option>
-    <option value={today}>Today</option>
-    <option
-      value={new Date(Date.now() + 24 * 60 * 60 * 1000)
-        .toISOString()
-        .split("T")[0]}
-    >
-      Tomorrow
-    </option>
-    <option value="Custom">Custom Date</option>
-  </select>
-
-  {dateFilter === "Custom" && (
-    <input
-      type="date"
-      value={customDate}
-      onChange={(e) => setCustomDate(e.target.value)}
-      className="w-full mt-3 px-4 py-3 border border-gray-300 rounded-xl bg-white text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
-    />
-  )}
-</div>
-  </div>
-
-  <button
-    onClick={() => {
-  setSearchTerm("");
-  setStatusFilter("All");
-  setPaymentFilter("All");
-  setSortOrder("Newest");
-  setDateFilter("All");
-  setCustomDate("");
-}}
-    className="mt-4 w-full sm:w-auto bg-gray-700 text-white px-5 py-2.5 rounded-xl font-semibold hover:bg-gray-800 transition"
-  >
-    Clear Filters
-  </button>
-</div>
-
-{/* Booking Cards */}
-{filteredBookings.length === 0 ? (
-  <div className="text-center py-12">
-    <div className="text-5xl mb-4">📋</div>
-
-    <h2 className="text-2xl font-bold text-gray-800 mb-2">
-      No Bookings Found
-    </h2>
-
-    <p className="text-gray-500">
-      There are no bookings matching this search or filter.
-    </p>
-  </div>
-) : (
-  sortedBookings.map((item) => (
-            <div
-              key={item.id}
-              className="mb-5 p-6 rounded-2xl border border-gray-100 shadow-md bg-white"
-            >
-
-              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-5">
-
-                <div>
-  <h2 className="text-xl font-bold text-gray-800">
-    Booking Details
-  </h2>
-  <p
-  className="text-sm text-gray-500 mt-1"
-  title={item.id}
->
-  Booking ID: {item.id.slice(0, 8).toUpperCase()}
-</p>
-</div>
-
-                <span
-                  className={`inline-block w-fit px-3 py-1 rounded-full text-sm font-bold ${
-                    item.status === "Pending"
-                      ? "bg-yellow-100 text-yellow-700"
-                      : item.status === "Confirmed"
-                      ? "bg-blue-100 text-blue-700"
-                      : item.status === "Completed"
-                      ? "bg-green-100 text-green-700"
-                      : "bg-red-100 text-red-700"
-                  }`}
-                >
-                  {item.status}
+              <div className="flex items-center gap-2">
+                <h1 className="text-xl sm:text-2xl font-black tracking-tight bg-gradient-to-r from-orange-500 via-rose-500 to-red-600 bg-clip-text text-transparent">
+                  FOOKA WASH COMMAND
+                </h1>
+                <span className="text-[10px] font-black uppercase tracking-wider bg-rose-50 text-rose-600 border border-rose-200 px-2 py-0.5 rounded-md">
+                  Admin Panel
                 </span>
-                {item.status === "Cancelled" && (
-  <div className="mt-3 bg-red-50 border border-red-200 rounded-xl p-3">
-    <p className="text-sm font-semibold text-red-700">
-      ⚠️ This booking has been cancelled.
-    </p>
-  </div>
-)}
-
               </div>
-
-              <div className="space-y-2 text-gray-700">
-
-                <p>
-                  <strong>Name:</strong>{" "}
-                  {item.name}
-                </p>
-
-                <p>
-  <strong>Phone:</strong>{" "}
-  {item.phone ? (
-    <a
-      href={`tel:${item.phone}`}
-      className="text-blue-600 font-semibold hover:underline"
-    >
-      {item.phone}
-    </a>
-  ) : (
-    "Not provided"
-  )}
-</p>
-{item.car_company && item.car_model && (
-  <p className="text-sm text-gray-700 mt-2">
-    🚘 Car: {item.car_company} {item.car_model}
-  </p>
-)}
-                <p>
-                  <strong>Car Number:</strong>{" "}
-                  {item.car_number}
-                </p>
-                <p>
-  <strong>📍 Service Location:</strong>{" "}
-  {item.location_address || "Location not provided"}
-</p>
-
-{item.latitude && item.longitude && (
-  <a
-    href={`https://www.google.com/maps?q=${item.latitude},${item.longitude}`}
-    target="_blank"
-    rel="noopener noreferrer"
-    className="inline-block mt-2 text-blue-600 font-semibold hover:underline"
-  >
-    🗺️ Open Location in Google Maps
-  </a>
-)}
-
-                <p>
-                  <strong>Service:</strong>{" "}
-                  {item.service}
-                </p>
-
-                <p>
-                  <strong>Date:</strong>{" "}
-                  {item.date}
-                </p>
-
-                <p>
-                  <strong>Time:</strong>{" "}
-                  {formatTimeRange(item.time)}
-                </p>
-
-                <p>
-                  <strong>Price:</strong>{" "}
-                  ₹{item.price}
-                </p>
-                <p className="flex flex-wrap items-center gap-2">
-  <strong className="text-gray-800">Payment:</strong>
-
-  <span
-    className={`px-3 py-1 rounded-full text-sm font-bold ${
-      item.payment_status === "Paid"
-        ? "bg-green-100 text-green-700"
-        : "bg-yellow-100 text-yellow-700"
-    }`}
-  >
-    {item.payment_status || "Unpaid"}
-  </span>
-
-  {item.payment_status !== "Paid" && (
-    <button
-      onClick={async () => {
-        const { error } = await supabase
-          .from("booking")
-          .update({ payment_status: "Paid" })
-          .eq("id", item.id);
-
-        if (error) {
-          console.error(error);
-          alert("Failed to update payment status!");
-          return;
-        }
-
-        setBookings((currentBookings) =>
-          currentBookings.map((booking) =>
-            booking.id === item.id
-              ? { ...booking, payment_status: "Paid" }
-              : booking
-          )
-        );
-      }}
-      className="bg-green-600 text-white px-3 py-1 rounded-lg text-sm font-semibold hover:bg-green-700 transition"
-    >
-      Mark Paid
-    </button>
-  )}
-</p>
-
-              </div>
-
-              {/* Status */}
-              <div className="mt-5">
-
-                <label className="block text-sm font-semibold text-gray-600 mb-2">
-                  Update Booking Status
-                </label>
-
-                <select
-                  value={item.status}
-                  disabled={item.status === "Cancelled" || item.status === "Completed"}
-                  className="w-full sm:w-auto min-h-11 px-4 py-2.5 border border-gray-300 rounded-xl font-semibold bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                  onChange={async (e) => {
-
-                    const newStatus = e.target.value;
-
-if (
-  item.status === "Cancelled" &&
-  newStatus !== "Cancelled"
-) {
-  alert("A cancelled booking cannot be reopened.");
-  return;
-}
-
-if (
-  item.status === "Completed" &&
-  newStatus !== "Completed"
-) {
-  alert("A completed booking cannot be changed.");
-  return;
-}
-
-if (
-  item.status === "Confirmed" &&
-  newStatus === "Pending"
-) {
-  alert("A confirmed booking cannot go back to Pending.");
-  return;
-}
-
-if (
-  item.status === "Completed" &&
-  newStatus !== "Completed"
-) {
-  alert("A completed booking cannot be changed.");
-  return;
-}
-
-                    const { error } = await supabase
-                      .from("booking")
-                      .update({
-                        status: newStatus,
-                      })
-                      .eq("id", item.id);
-
-                    if (error) {
-                      console.error(error);
-                      alert("Status update failed!");
-                      return;
-                    }
-
-                    setBookings((currentBookings) =>
-  currentBookings.map((b) =>
-    b.id === item.id
-      ? {
-          ...b,
-          status: newStatus,
-        }
-      : b
-  )
-);
-
-setStatusMessage("Booking status updated successfully!");
-
-setTimeout(() => {
-  setStatusMessage("");
-}, 3000);
-                  }}
-                >
-                  <option value="Pending">
-                    Pending
-                  </option>
-
-                  <option value="Confirmed">
-                    Confirmed
-                  </option>
-
-                  <option value="Completed">
-                    Completed
-                  </option>
-
-                  <option value="Cancelled">
-                    Cancelled
-                  </option>
-                </select>
-
-              </div>
-
+              <p className="text-xs text-slate-400 font-medium mt-0.5">
+                Cycle: <span className="font-bold text-slate-700">{cycleInfo.cycleLabel}</span> • Cutoff: Sunday 8:00 PM
+              </p>
             </div>
-          ))
+          </div>
+
+          <div className="flex items-center gap-2 flex-wrap">
+            {statusMessage && (
+              <span className="text-xs font-bold px-3 py-1.5 rounded-xl bg-rose-50 text-rose-600 border border-rose-200 animate-in fade-in">
+                {statusMessage}
+              </span>
+            )}
+            
+            {/* Storage Purge Action */}
+            <button
+              onClick={handlePurgeOldCompletedBookings}
+              disabled={purgingBookings}
+              className="text-xs font-bold px-3.5 py-2.5 rounded-xl border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700 transition shadow-sm"
+              title="Delete past weeks' completed bookings to reduce Supabase database usage"
+            >
+              {purgingBookings ? "Purging..." : "🗑️ Purge Past Bookings"}
+            </button>
+
+            <Link
+              href="/admin/partners/manage"
+              className="text-xs font-bold px-4 py-2.5 rounded-xl border border-slate-200 text-slate-700 bg-white hover:bg-slate-50 transition shadow-sm"
+            >
+              Partner Verification
+            </Link>
+            <Link
+              href="/bookings"
+              className="text-xs font-bold px-4 py-2.5 rounded-xl border border-slate-200 text-slate-700 bg-white hover:bg-slate-50 transition shadow-sm"
+            >
+              Customer View
+            </Link>
+            <button
+              onClick={() => {
+                fetchPendingPayouts();
+                window.location.reload();
+              }}
+              className="text-xs font-bold px-4 py-2.5 rounded-xl bg-gradient-to-r from-orange-500 to-rose-600 text-white hover:opacity-90 transition shadow-md shadow-orange-500/20"
+            >
+              🔄 Refresh
+            </button>
+          </div>
+        </header>
+
+        {/* Realtime Alert Banner */}
+        {newBookingAlert && (
+          <div className="bg-gradient-to-r from-orange-500 via-rose-500 to-red-600 p-0.5 rounded-3xl shadow-xl animate-in fade-in">
+            <div className="bg-white p-5 rounded-[22px] flex items-start sm:items-center justify-between gap-4">
+              <div className="flex items-start gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-orange-500 to-rose-500 text-white flex items-center justify-center text-lg font-bold shadow-md shadow-orange-500/25 flex-shrink-0">
+                  ⚡
+                </div>
+                <div>
+                  <span className="text-[10px] font-black uppercase tracking-wider bg-rose-50 text-rose-600 border border-rose-200 px-2 py-0.5 rounded-md">
+                    Incoming Wash Request
+                  </span>
+                  <p className="text-sm font-black text-slate-900 mt-1">
+                    {newBookingAlert.name} ordered {newBookingAlert.service} for ₹{newBookingAlert.price}
+                  </p>
+                  <p className="text-xs text-slate-500">
+                    Vehicle: {newBookingAlert.car_number} • Slot: {newBookingAlert.date} at {formatTimeRange(newBookingAlert.time)}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setNewBookingAlert(null)}
+                className="text-slate-400 hover:text-slate-700 font-black text-xl p-1"
+              >
+                ×
+              </button>
+            </div>
+          </div>
         )}
 
-        </div>
-      )}
+        {/* Metrics Grid with Rule 2 (Cancellations Counter Box Included) */}
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
+          <div className="p-5 bg-white rounded-3xl border border-slate-200/80 shadow-sm relative overflow-hidden">
+            <p className="text-[11px] font-black uppercase text-slate-400">Total Washes</p>
+            <p className="text-3xl font-black text-slate-900 mt-1">{bookings.length}</p>
+          </div>
 
+          <div className="p-5 bg-gradient-to-br from-amber-50 to-orange-50 rounded-3xl border border-orange-200 shadow-sm relative overflow-hidden">
+            <p className="text-[11px] font-black uppercase text-amber-700">Pending Assignment</p>
+            <p className="text-3xl font-black text-amber-600 mt-1">{pendingCount}</p>
+          </div>
+
+          <div className="p-5 bg-gradient-to-br from-rose-50 to-red-50 rounded-3xl border border-rose-200 shadow-sm relative overflow-hidden">
+            <p className="text-[11px] font-black uppercase text-rose-700">Active Washers</p>
+            <p className="text-3xl font-black text-rose-600 mt-1">{activeCount}</p>
+          </div>
+
+          <div className="p-5 bg-gradient-to-br from-red-50 to-rose-50 rounded-3xl border border-rose-300 shadow-sm relative overflow-hidden">
+            <p className="text-[11px] font-black uppercase text-rose-800">Cancelled Washes</p>
+            <p className="text-3xl font-black text-rose-700 mt-1">{cancelledCount}</p>
+          </div>
+
+          <div className="p-5 bg-gradient-to-br from-emerald-50 to-teal-50 rounded-3xl border border-emerald-200 shadow-sm relative overflow-hidden col-span-2 sm:col-span-1">
+            <p className="text-[11px] font-black uppercase text-emerald-700">Realized Revenue</p>
+            <p className="text-3xl font-black text-emerald-600 mt-1">₹{totalRevenue}</p>
+          </div>
+        </div>
+
+        {/* PARTNER PAYOUT SETTLEMENT SECTION (Rule 3 Implemented) */}
+        <div className="bg-white rounded-3xl border border-rose-100 shadow-sm p-5 sm:p-6 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-4">
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="text-lg">💰</span>
+                <h2 className="text-base font-black uppercase tracking-tight text-slate-900">
+                  Partner Payouts & Weekly Settlements
+                </h2>
+                {!isSettlementWindowOpen ? (
+                  <span className="text-[9px] font-black uppercase px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 border border-slate-200">
+                    🔒 Locks Until Sun 8:00 PM
+                  </span>
+                ) : (
+                  <span className="text-[9px] font-black uppercase px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 border border-emerald-300 animate-pulse">
+                    🔓 Settlement Window Active
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Review weekly 70% wash shares. Settlement button activates after Sunday 08:00 PM for Monday bank transfer (NEFT/Account).
+              </p>
+            </div>
+
+            <button
+              onClick={() => fetchPendingPayouts()}
+              className="text-xs font-bold px-3 py-1.5 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 transition self-start sm:self-auto"
+            >
+              🔄 Refresh Balances
+            </button>
+          </div>
+
+          {payoutSummaries.length === 0 ? (
+            <div className="text-center py-6 text-slate-400 font-medium text-xs">
+              ✨ All partner balances are settled! No pending payouts at this time.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+              {payoutSummaries.map((item) => (
+                <div
+                  key={item.partner_id}
+                  className="p-4 rounded-2xl border border-slate-200/80 bg-slate-50/50 hover:bg-white hover:border-orange-200 transition flex flex-col justify-between space-y-3"
+                >
+                  <div>
+                    <div className="flex items-center justify-between">
+                      <span className="font-black text-sm text-slate-900">{item.partner_name}</span>
+                      <span className="text-[10px] font-black uppercase px-2 py-0.5 rounded-md bg-amber-50 text-amber-700 border border-amber-200">
+                        {item.pending_washes} {item.pending_washes === 1 ? "wash" : "washes"}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-2 mt-1">
+                      <span className="text-xs text-slate-500">📞 {item.partner_phone}</span>
+                      <span className="text-[10px] font-bold text-slate-400">
+                        • Bank Payout Mode
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="pt-3 border-t border-slate-200/60 flex items-center justify-between">
+                    <div>
+                      <span className="text-[10px] uppercase font-bold text-slate-400 block">
+                        Pending Payout
+                      </span>
+                      <span className="text-lg font-black text-rose-600">
+                        ₹{item.pending_amount.toFixed(0)}
+                      </span>
+                    </div>
+
+                    <button
+                      onClick={() => handleSettlePartner(item)}
+                      disabled={settlingPartnerId === item.partner_id || !isSettlementWindowOpen}
+                      className={`px-3.5 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition shadow-sm ${
+                        isSettlementWindowOpen
+                          ? "bg-gradient-to-r from-emerald-600 to-teal-600 hover:opacity-90 text-white cursor-pointer"
+                          : "bg-slate-200 text-slate-400 cursor-not-allowed"
+                      }`}
+                      title={
+                        isSettlementWindowOpen
+                          ? "Mark as settled"
+                          : "Locked during active wash week. Opens Sunday 8:00 PM."
+                      }
+                    >
+                      {settlingPartnerId === item.partner_id
+                        ? "Settling..."
+                        : isSettlementWindowOpen
+                        ? "Mark Settled ✓"
+                        : "Locked (Sun 8 PM)"}
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Search & Filter Bar */}
+        <div className="bg-white p-5 rounded-3xl border border-slate-200/80 shadow-sm space-y-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+            <input
+              type="text"
+              placeholder="Search customer, phone, plate..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="w-full text-xs px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-rose-500 font-medium"
+            />
+
+            <select
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+              className="w-full text-xs font-semibold px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-rose-500 bg-white"
+            >
+              <option value="All">All Operational Statuses</option>
+              <option value="Pending">Pending (Unassigned)</option>
+              <option value="Confirmed">Confirmed</option>
+              <option value="On the way">On the way</option>
+              <option value="Arrived">Arrived</option>
+              <option value="Washing">Washing</option>
+              <option value="Completed">Completed</option>
+              <option value="Cancelled">Cancelled</option>
+            </select>
+
+            <select
+              value={paymentFilter}
+              onChange={(e) => setPaymentFilter(e.target.value)}
+              className="w-full text-xs font-semibold px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-rose-500 bg-white"
+            >
+              <option value="All">All Settlements</option>
+              <option value="Paid">Paid</option>
+              <option value="Unpaid">Unpaid / Pay on Service</option>
+            </select>
+
+            <select
+              value={zoneFilter}
+              onChange={(e) => setZoneFilter(e.target.value)}
+              className="w-full text-xs font-semibold px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-rose-500 bg-white"
+            >
+              <option value="All">All Kolkata Zones</option>
+              {KOLKATA_ZONES.map((z: string) => (
+                <option key={z} value={z}>
+                  {z}
+                </option>
+              ))}
+            </select>
+
+            <select
+              value={dateFilter}
+              onChange={(e) => setDateFilter(e.target.value)}
+              className="w-full text-xs font-semibold px-4 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-rose-500 bg-white"
+            >
+              <option value="All">All Dates</option>
+              <option value={today}>Scheduled Today</option>
+              <option value="Custom">Custom Date</option>
+            </select>
+          </div>
+
+          {dateFilter === "Custom" && (
+            <input
+              type="date"
+              value={customDate}
+              onChange={(e) => setCustomDate(e.target.value)}
+              className="text-xs px-4 py-2 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-rose-500"
+            />
+          )}
+        </div>
+
+        {/* Orders Feed */}
+        {sortedBookings.length === 0 ? (
+          <div className="bg-white rounded-3xl p-16 text-center border border-slate-200/80 shadow-sm space-y-2">
+            <span className="text-4xl block">🧼</span>
+            <p className="text-base font-black text-slate-800">No matching orders found</p>
+            <p className="text-xs text-slate-400">Try adjusting your filters or search keywords.</p>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {sortedBookings.map((item) => {
+              const review = reviews[item.id];
+
+              const custLat = item.latitude ?? item.customer_lat ?? null;
+              const custLng = item.longitude ?? item.customer_lng ?? null;
+
+              const rankedPartners = partners
+                .filter(
+                  (p) => !item.booking_zone || p.operating_zone === item.booking_zone
+                )
+                .map((p) => {
+                  const dist = getDistanceFromLatLonInKm(
+                    custLat,
+                    custLng,
+                    p.current_lat,
+                    p.current_lng
+                  );
+                  return { ...p, dist };
+                })
+                .sort((a, b) => {
+                  if (Boolean(a.is_available) !== Boolean(b.is_available)) {
+                    return a.is_available ? -1 : 1;
+                  }
+                  if (a.dist === null) return 1;
+                  if (b.dist === null) return -1;
+                  return a.dist - b.dist;
+                });
+
+              return (
+                <div
+                  key={item.id}
+                  className="bg-white rounded-3xl border border-slate-200/80 shadow-sm p-5 sm:p-6 space-y-4 hover:border-orange-200 transition"
+                >
+                  {/* Card Header */}
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-[10px] font-black uppercase px-2 py-0.5 rounded-md bg-orange-50 text-orange-600 border border-orange-200">
+                          #{item.id.slice(0, 8).toUpperCase()}
+                        </span>
+                        {item.booking_zone && (
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-md bg-rose-50 text-rose-600 border border-rose-200">
+                            📍 {item.booking_zone}
+                          </span>
+                        )}
+                        <h3 className="font-black text-base text-slate-900">{item.name}</h3>
+                      </div>
+                      <p className="text-xs text-slate-500 font-medium mt-1">
+                        {item.service} • ₹{item.price} • {item.date} ({formatTimeRange(item.time)})
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={`text-[10px] font-black uppercase px-2.5 py-1 rounded-full ${
+                          item.payment_status?.toLowerCase() === "paid"
+                            ? "bg-emerald-50 text-emerald-700 border border-emerald-200"
+                            : "bg-amber-50 text-amber-700 border border-amber-200"
+                        }`}
+                      >
+                        {item.payment_status || "Unpaid"}
+                      </span>
+                      <span
+                        className={`text-[10px] font-black uppercase px-3 py-1 rounded-full ${
+                          item.status === "Cancelled"
+                            ? "bg-rose-100 text-rose-700 border border-rose-300"
+                            : "bg-gradient-to-r from-orange-500 to-rose-600 text-white shadow-sm shadow-orange-500/20"
+                        }`}
+                      >
+                        {item.status}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Customer & Vehicle Info */}
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                    <div className="p-3.5 bg-slate-50/70 rounded-2xl border border-slate-100">
+                      <span className="text-[10px] font-bold uppercase text-slate-400 block">Customer Phone</span>
+                      {item.phone ? (
+                        <a href={`tel:${item.phone}`} className="font-extrabold text-rose-600 hover:underline mt-0.5 block">
+                          📞 {item.phone}
+                        </a>
+                      ) : (
+                        <span className="text-slate-400 mt-0.5 block">Not provided</span>
+                      )}
+                    </div>
+
+                    <div className="p-3.5 bg-slate-50/70 rounded-2xl border border-slate-100">
+                      <span className="text-[10px] font-bold uppercase text-slate-400 block">Vehicle Specification</span>
+                      <span className="font-extrabold text-slate-800 mt-0.5 block">
+                        {item.car_company} {item.car_model} •{" "}
+                        <span className="font-mono text-rose-600">{item.car_number}</span>
+                      </span>
+                    </div>
+
+                    <div className="p-3.5 bg-slate-50/70 rounded-2xl border border-slate-100">
+                      <span className="text-[10px] font-bold uppercase text-slate-400 block">Service Address</span>
+                      <span className="font-medium text-slate-700 truncate block mt-0.5">
+                        📍 {item.location_address}
+                      </span>
+                      {custLat && custLng && (
+                        <a
+                          href={`https://www.google.com/maps?q=${custLat},${custLng}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-[10px] font-bold text-rose-600 hover:underline inline-block mt-1"
+                        >
+                          Google Maps Pin ↗
+                        </a>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Customer Review Card */}
+                  {review && (
+                    <div className="p-3.5 bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200 rounded-2xl flex items-center justify-between text-xs">
+                      <div>
+                        <span className="font-black text-amber-700">
+                          ★ {review.rating} / 5 Star Customer Rating
+                        </span>
+                        {review.comment && (
+                          <p className="text-slate-600 italic mt-0.5">"{review.comment}"</p>
+                        )}
+                      </div>
+                      <span className="text-[10px] font-bold uppercase text-orange-600 bg-white/80 px-2 py-0.5 rounded-md border border-orange-200">
+                        Verified Review
+                      </span>
+                    </div>
+                  )}
+
+                  {/* Dispatch Controls */}
+                  <div className="pt-2 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 bg-gradient-to-r from-rose-50/40 via-orange-50/30 to-slate-50 p-4 rounded-2xl border border-rose-100">
+                    <div className="flex-1">
+                      <label className="block text-[10px] font-black uppercase text-rose-800 tracking-wider mb-1">
+                        Dispatch Washer Partner ({item.booking_zone || "All Zones"})
+                      </label>
+                      <select
+                        value={item.assigned_partner_id || ""}
+                        onChange={(e) => assignPartner(item.id, e.target.value)}
+                        className="w-full text-xs font-semibold px-3 py-2.5 rounded-xl border border-rose-200 bg-white focus:outline-none focus:ring-2 focus:ring-rose-500 text-slate-800"
+                      >
+                        <option value="">
+                          {rankedPartners.length > 0
+                            ? "Select verified partner in this zone..."
+                            : "No active partners found in this zone"}
+                        </option>
+                        {rankedPartners.map((p) => {
+                          const onlineStatus = p.is_available ? "🟢 ONLINE" : "🔴 OFFLINE";
+                          const distanceText =
+                            p.dist !== null ? `${p.dist} km gap` : "GPS Off";
+                          const washMetrics = `${p.total_washes_completed || 0} washes (${p.avg_wash_time_minutes || 30}m avg)`;
+
+                          return (
+                            <option key={p.id} value={p.user_id}>
+                              {onlineStatus} | {p.full_name} ({distanceText}) • {washMetrics} — {p.phone}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </div>
+
+                    {/* SOP Audit Drawer Trigger */}
+                    <div className="flex items-end">
+                      <button
+                        type="button"
+                        onClick={() => setSelectedBookingForAudit(item)}
+                        className="px-3.5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl text-xs font-bold transition flex items-center gap-1.5 shadow-sm border border-slate-200 whitespace-nowrap"
+                      >
+                        ⏱️ Audit SOP & Photos
+                      </button>
+                    </div>
+
+                    <div>
+                      <label className="block text-[10px] font-black uppercase text-slate-500 tracking-wider mb-1">
+                        Override Status
+                      </label>
+                      <select
+                        value={item.status}
+                        onChange={async (e) => {
+                          const newStatus = e.target.value;
+                          const { error } = await supabase
+                            .from("booking")
+                            .update({ status: newStatus })
+                            .eq("id", item.id);
+
+                          if (error) {
+                            alert("Status update failed: " + error.message);
+                          } else {
+                            setBookings((curr) =>
+                              curr.map((b) => (b.id === item.id ? { ...b, status: newStatus } : b))
+                            );
+                          }
+                        }}
+                        className="text-xs font-bold px-3 py-2 rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-rose-500 text-slate-800"
+                      >
+                        <option value="Pending">Pending</option>
+                        <option value="Confirmed">Confirmed</option>
+                        <option value="On the way">On the way</option>
+                        <option value="Arrived">Arrived</option>
+                        <option value="Washing">Washing</option>
+                        <option value="Completed">Completed</option>
+                        <option value="Cancelled">Cancelled</option>
+                      </select>
+                    </div>
+
+                    {item.payment_status !== "Paid" && (
+                      <div>
+                        <label className="block text-[10px] font-black uppercase text-slate-500 tracking-wider mb-1">
+                          Settlement
+                        </label>
+                        <button
+                          onClick={async () => {
+                            const { error } = await supabase
+                              .from("booking")
+                              .update({ payment_status: "Paid" })
+                              .eq("id", item.id);
+
+                            if (!error) {
+                              setBookings((curr) =>
+                                curr.map((b) =>
+                                  b.id === item.id ? { ...b, payment_status: "Paid" } : b
+                                )
+                              );
+                            }
+                          }}
+                          className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-extrabold uppercase tracking-wider transition shadow-sm"
+                        >
+                          Mark Paid
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <SopAuditDrawer
+        isOpen={Boolean(selectedBookingForAudit)}
+        onClose={() => setSelectedBookingForAudit(null)}
+        booking={selectedBookingForAudit}
+        partner={partners.find((p) => p.user_id === selectedBookingForAudit?.assigned_partner_id)}
+        onBookingUpdated={handleAuditPhotoUpdate}
+      />
     </main>
   );
-}
-
-function sort(arg0: (a: any, b: any) => number) {
-    throw new Error("Function not implemented.");
 }
